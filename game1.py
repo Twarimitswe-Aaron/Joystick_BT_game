@@ -23,28 +23,89 @@ BLUE = (100, 150, 255)
 # SERIAL COMMUNICATION
 # ==============================
 def find_active_port():
-    """Find active serial port with optimized search."""
-    ports = sorted(
-        [p.device for p in serial.tools.list_ports.comports()],
-        key=lambda x: int(x[3:]) if x[3:].isdigit() else 0,
-        reverse=True
-    )
-    
-    for port in ports:
+    """Scan for active COM port with expected data format in descending order"""
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("❌ No COM ports found!")
+        return None
+
+    # Sort ports by COM number (highest first)
+    def get_com_num(port):
         try:
-            with serial.Serial(port, BAUD, timeout=1) as ser:
-                print(f"Testing {port}...")
-                time.sleep(2)
-                if ser.in_waiting:
-                    data = ser.readline().decode(errors="ignore").strip()
-                    if data:
-                        print(f"✅ Active data found on {port}: {data}")
-                        # Reopen without context manager to keep port open
-                        return serial.Serial(port, BAUD, timeout=1)
-        except (serial.SerialException, OSError):
+            return int(''.join(filter(str.isdigit, port.device)))
+        except:
+            return 0
+    ports.sort(key=get_com_num, reverse=True)
+
+    print("\n🔍 Available COM ports (highest to lowest):")
+    for port in ports:
+        print(f"  • {port.device}: {port.description}")
+
+    # Try preferred ports first (Bluetooth / HC-05 / Arduino)
+    preferred_keywords = ("HC-05", "Bluetooth", "Arduino", "Serial")
+    def port_priority(p):
+        desc = (p.description or "").lower()
+        for kw in preferred_keywords:
+            if kw.lower() in desc:
+                return 0
+        return 1
+    ports.sort(key=port_priority)  # Prioritize but keep descending order
+
+    # Detection strategy: try each port, require multiple valid readings
+    for port in ports:
+        print(f"\n📡 Testing {port.device} ({port.description})...")
+        ser = None
+        try:
+            # Open with short timeout for faster detection
+            ser = serial.Serial(port.device, BAUD, timeout=0.1)
+            time.sleep(0.1)  # Brief pause for device
+            ser.reset_input_buffer()
+
+            valid_count = 0
+            attempts = 0
+            start = time.time()
+            
+            # Try for up to 2 seconds
+            while time.time() - start < 2.0 and attempts < 60:
+                attempts += 1
+                try:
+                    raw = ser.readline()
+                    if not raw:
+                        time.sleep(0.02)
+                        continue
+                    
+                    data = raw.decode(errors='ignore')
+                    print(f"  raw[{port.device}]: {repr(data)}")
+                    s = data.strip()
+                    
+                    if s and "X:" in s and "Y:" in s:
+                        print(f"    attempting parse: {s}")
+                        x, y = parse_xy(s)
+                        if x is not None:  # Successfully parsed
+                            valid_count += 1
+                            if valid_count >= 2:  # Require 2 valid readings
+                                print(f"✅ Found joystick on {port.device}")
+                                print(f"   Last reading: X={x}, Y={y}")
+                                return ser
+                
+                except Exception as e:
+                    print(f"    parse error: {e}")
+                    time.sleep(0.02)
+                    continue
+
+            if ser:
+                ser.close()
+
+        except Exception as e:
+            print(f"Error on {port.device}: {e}")
+            if ser:
+                try:
+                    ser.close()
+                except:
+                    pass
             continue
-    
-    print("❌ No active COM port found.")
+
+    print("\n❌ No joystick found!")
     return None
 
 def parse_xy(line):
@@ -215,12 +276,12 @@ class HUD:
 # MAIN GAME LOOP
 # ==============================
 def start_joystick_view(serial_port):
-    """Optimized main game loop."""
+    """Optimized main game loop with enhanced physics."""
     # Initialize pygame with performance flags
     pygame.init()
     flags = pygame.DOUBLEBUF | pygame.HWSURFACE
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), flags)
-    pygame.display.set_caption("Jet Fighter Simulator - Optimized")
+    pygame.display.set_caption("Jet Fighter Simulator")
     
     # Limit events for better performance
     pygame.event.set_allowed([QUIT, KEYDOWN])
@@ -230,13 +291,24 @@ def start_joystick_view(serial_port):
     hud = HUD(WINDOW_WIDTH, WINDOW_HEIGHT)
     clock = pygame.time.Clock()
     
-    # Jet state
+    # Enhanced jet state with physics parameters
     jet_state = {
         'x': WINDOW_WIDTH // 2,
         'y': WINDOW_HEIGHT * 2 // 3,
-        'angle': 0.0,
-        'speed': 0.0,
-        'size': 30
+        'z': 0.0,
+        'roll': 0.0,  # banking angle
+        'pitch': 0.0,  # nose up/down
+        'yaw': 0.0,   # heading
+        'velocity_x': 0.0,
+        'velocity_y': 0.0,
+        'velocity_z': 0.0,
+        'speed': 0.0,  # Add speed tracking
+        'size': 30,
+        # Flight parameters
+        'roll_max': 45.0,
+        'pitch_max': 30.0,
+        'max_speed': 500.0,
+        'min_speed': 100.0
     }
     
     # Game state
@@ -307,40 +379,75 @@ def _handle_events(serial_port, game_state, jet_state):
     return True
 
 def _update_game_state(serial_port, game_state, jet_state, dt):
-    """Update game state based on serial input."""
-    # Read serial data
+    """Update game state based on serial input with immediate response."""
     try:
-        while serial_port.in_waiting > 0:
-            line = serial_port.readline().decode(errors="ignore").strip()
-            x, y = parse_xy(line)
-            if x is not None and y is not None:
-                game_state['x_val'], game_state['y_val'] = x, y
+        # Process all available serial data (non-blocking)
+        if serial_port.in_waiting > 0:
+            data = serial_port.read(serial_port.in_waiting).decode(errors='ignore')
+            lines = data.splitlines()
+            
+            # Process most recent complete line
+            for line in reversed(lines):
+                x, y = parse_xy(line)
+                if x is not None and y is not None:
+                    game_state['x_val'], game_state['y_val'] = x, y
+                    break
     except Exception as e:
         if "timeout" not in str(e).lower():
             print(f"Serial error: {e}")
     
-    # Calculate controls
-    roll = (game_state['x_val'] - 512) / 512.0 * 2
-    pitch = (game_state['y_val'] - 512) / 512.0 * 2
+    # Calculate normalized controls (-1 to 1)
+    roll = (game_state['x_val'] - 512) / 511.5  # left/right controls roll/heading
+    pitch = -(game_state['y_val'] - 512) / 511.5  # up/down controls pitch/elevation
     
-    # Update jet physics
-    target_angle = -roll * 0.5
-    jet_state['angle'] += (target_angle - jet_state['angle']) * (1.0 - math.exp(-10.0 * dt))
+    # Apply deadzone
+    deadzone = 0.1
+    roll = 0 if abs(roll) < deadzone else roll
+    pitch = 0 if abs(pitch) < deadzone else pitch
     
-    base_speed = 5.0
-    target_speed = base_speed * (1.0 - pitch * 0.5)
-    jet_state['speed'] += (target_speed - jet_state['speed']) * (1.0 - math.exp(-5.0 * dt))
+    # Update aircraft physics
+    # Roll affects turning (banking turns the plane)
+    target_roll = roll * jet_state['roll_max']
+    jet_state['roll'] = jet_state['roll'] * 0.9 + target_roll * 0.1
     
-    # Update position
-    jet_state['x'] += math.sin(jet_state['angle']) * -jet_state['speed'] * dt * 60
-    jet_state['y'] += math.cos(jet_state['angle']) * jet_state['speed'] * 0.5 * dt * 60
+    # Pitch controls vertical movement and affects speed
+    target_pitch = pitch * jet_state['pitch_max']
+    jet_state['pitch'] = jet_state['pitch'] * 0.9 + target_pitch * 0.1
     
-    # Boundary checking
-    jet_state['x'] = max(jet_state['size'], min(WINDOW_WIDTH - jet_state['size'], jet_state['x']))
-    jet_state['y'] = max(jet_state['size'], min(WINDOW_HEIGHT - jet_state['size'], jet_state['y']))
+    # Convert angles to radians
+    roll_rad = math.radians(jet_state['roll'])
+    pitch_rad = math.radians(jet_state['pitch'])
     
-    # Update score
-    game_state['score'] += jet_state['speed'] * dt * 0.5
+    # Basic thrust (more when pulling back/up on stick)
+    base_thrust = max(0, pitch) * jet_state['max_speed']
+    
+    # Turn rate based on roll angle and speed
+    turn_rate = -math.sin(roll_rad) * base_thrust * 0.02
+    
+    # Forward speed reduced by pitch angle
+    forward_speed = base_thrust * math.cos(abs(pitch_rad))
+    
+    # Update velocities with momentum
+    jet_state['velocity_x'] = jet_state['velocity_x'] * 0.95 + turn_rate
+    jet_state['velocity_y'] = jet_state['velocity_y'] * 0.95 + forward_speed * 0.1
+    
+    # Apply drag
+    drag = 0.98
+    jet_state['velocity_x'] *= drag
+    jet_state['velocity_y'] *= drag
+    
+    # Update position with delta time scaling
+    move_scale = 60.0 * dt  # Scale movement by frame time
+    jet_state['x'] += jet_state['velocity_x'] * move_scale
+    jet_state['y'] += jet_state['velocity_y'] * move_scale
+    
+    # World wrapping (loop around screen edges)
+    jet_state['x'] = jet_state['x'] % WINDOW_WIDTH
+    jet_state['y'] = max(50, min(WINDOW_HEIGHT - 50, jet_state['y']))
+    
+    # Update speed and score based on movement
+    jet_state['speed'] = math.sqrt(jet_state['velocity_x']**2 + jet_state['velocity_y']**2)
+    game_state['score'] += jet_state['speed'] * dt
 
 def _render_frame(screen, stars, hud, game_state, jet_state, joy_center, dt):
     """Render a single frame."""
@@ -351,9 +458,9 @@ def _render_frame(screen, stars, hud, game_state, jet_state, joy_center, dt):
     stars.update(speed_factor, dt * 60)
     stars.draw(screen)
     
-    # Draw jet
+    # Draw jet with roll angle
     draw_jet(screen, int(jet_state['x']), int(jet_state['y']), 
-             jet_state['angle'], jet_state['size'])
+             jet_state['roll'], jet_state['size'])
     
     # Draw HUD
     hud.draw(screen, jet_state['speed'], game_state['score'])
