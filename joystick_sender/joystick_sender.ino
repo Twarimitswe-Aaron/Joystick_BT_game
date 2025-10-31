@@ -35,5 +35,5 @@ void loop() {
   bt.println(yValue);
 
 
-  delay(100);
+  delay(50);
 }

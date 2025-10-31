@@ -3,179 +3,363 @@ import serial.tools.list_ports
 import time
 import pygame
 import math
+import sys
 
 BAUD = 38400  # for HC-05 Bluetooth
 
-# List all COM ports
-ports = [p.device for p in serial.tools.list_ports.comports()]
-print("Available ports:", ports)
+def find_bluetooth_port():
+    # Get all ports and sort them by COM number in descending order
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("❌ No COM ports found!")
+        sys.exit(1)
 
-found = None
-ser = None
-
-for port in ports:
-    try:
-        ser_temp = serial.Serial(port, BAUD, timeout=1)
-        print(f"Listening on {port}...")
-        time.sleep(2)  # allow device to start sending
-
-        # Read multiple lines to increase chances of finding valid data
-        for _ in range(10):  # Try reading up to 10 lines
-            data = ser_temp.readline().decode(errors='ignore').strip()
-            if data:
-                print(f"Raw data received: '{data}'")  # Debug output
-                try:
-                    # Handle both formats: with timestamp and without
-                    if "->" in data:
-                        # Format: "08:59:30.001 -> X:448,Y:461"
-                        data_part = data.split("-> ")[1]
-                    else:
-                        # Format: "X:448,Y:461"
-                        data_part = data
-                    
-                    # Parse X and Y values (comma separated)
-                    if "X:" in data_part and "Y:" in data_part:
-                        x_str = data_part.split("X:")[1].split(",")[0]
-                        y_str = data_part.split("Y:")[1]
-                        
-                        x = int(x_str)
-                        y = int(y_str)
-                        
-                        print(f"\n✅ Data found on {port}: X={x}, Y={y}\n")
-                        found = port
-                        ser = ser_temp  # Keep this serial connection open
-                        break
-                except Exception as e:
-                    print(f"Parsing error: {e}")
-                    continue
-        
-        if found:
-            break
-        else:
-            ser_temp.close()
-
-    except Exception as e:
-        print(f"Error on port {port}: {e}")
-        # Ignore "semaphore timeout" and similar errors
-        pass
-
-if not found:
-    print("\n❌ No active COM port produced data in the expected format.")
-    print("Please check:")
-    print("1. Bluetooth module is powered on")
-    print("2. Correct BAUD rate (38400)")
-    print("3. Device is actually sending data")
-    print("4. No other program is using the serial port")
-    exit()
-
-# Set timeout to 0 for non-blocking reads
-ser.timeout = 0
-
-# Initialize Pygame
-pygame.init()
-screen = pygame.display.set_mode((800, 600))
-pygame.display.set_caption("3D Airplane Control")
-clock = pygame.time.Clock()
-
-# Initial values (adjust center based on your device's neutral position)
-center_x = 448  # Neutral X from sample data
-center_y = 461  # Neutral Y from sample data
-x = center_x
-y = center_y
-
-# Sensitivity factors (adjust as needed)
-roll_max_deg = 45
-pitch_max_deg = 30
-
-running = True
-while running:
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-
-    # Read all available serial data and update to the latest X/Y
-    data_buffer = ""
-    while True:
+    # Sort ports by COM number (highest first)
+    def get_com_num(port):
         try:
-            data = ser.readline().decode(errors='ignore').strip()
-            if not data:
-                break
-            
-            print(f"Real-time data: {data}")  # Debug output
-            
+            return int(''.join(filter(str.isdigit, port.device)))
+        except:
+            return 0
+
+    ports.sort(key=get_com_num, reverse=True)
+
+    print("\n🔍 Available COM ports (highest to lowest):")
+    for port in ports:
+        print(f"  • {port.device}: {port.description}")
+
+    # Try preferred ports first (Bluetooth / HC-05 / Arduino), then all ports
+    preferred_keywords = ("HC-05", "Bluetooth", "Arduino", "Serial")
+    def port_priority(p):
+        desc = (p.description or "").lower()
+        for kw in preferred_keywords:
+            if kw.lower() in desc:
+                return 0
+        return 1
+
+    ports.sort(key=port_priority)
+
+    # Detection strategy: for each port, open and read bursts, require multiple valid lines
+    for port in ports:
+        print(f"\n📡 Testing {port.device} ({port.description})...")
+        ser = None
+        try:
+            # Open with short timeout to not block; we will poll in small sleeps
+            ser = serial.Serial(port.device, BAUD, timeout=0.1)
+            # Give device a small moment to start sending
+            time.sleep(0.1)
+            ser.reset_input_buffer()
+
+            valid_count = 0
+            attempts = 0
+            start = time.time()
+            # Try up to 2 seconds, reading small bursts
+            while time.time() - start < 2.0 and attempts < 60:
+                attempts += 1
+                try:
+                    # Read one line (non-blocking due to timeout)
+                    raw = ser.readline()
+                    if not raw:
+                        time.sleep(0.02)
+                        continue
+                    data = raw.decode(errors='ignore')
+                    print(f"  raw[{port.device}]: {repr(data)}")
+                    s = data.strip()
+                    if not s:
+                        continue
+
+                    # Accept formats like 'X:448,Y:461' or 'X: 448 | Y: 461'
+                    if "X:" in s and "Y:" in s:
+                        # Normalize separators
+                        if "|" in s:
+                            parts = s.replace("|", ",").split(",")
+                        else:
+                            parts = s.split(",")
+
+                        if len(parts) >= 2:
+                            try:
+                                x_part = parts[0]
+                                y_part = parts[1]
+                                x = int(''.join(c for c in x_part if c.isdigit()))
+                                y = int(''.join(c for c in y_part if c.isdigit()))
+                                print(f"    parsed X={x} Y={y}")
+                                if 0 <= x <= 1023 and 0 <= y <= 1023:
+                                    valid_count += 1
+                                    # require 2 valid readings to be confident
+                                    if valid_count >= 2:
+                                        print(f"✅ Found joystick on {port.device}")
+                                        print(f"   Last reading: X={x}, Y={y}")
+                                        return ser
+                            except Exception as e:
+                                print(f"    parse error: {e}")
+                                continue
+                except Exception as e:
+                    print(f"  read error on {port.device}: {e}")
+                    time.sleep(0.05)
+
+            # nothing found on this port
             try:
-                # Handle both formats: with timestamp and without
-                if "->" in data:
-                    data_part = data.split("-> ")[1]
-                else:
-                    data_part = data
-                
-                # Parse X and Y values (comma separated)
-                if "X:" in data_part and "Y:" in data_part:
-                    x_str = data_part.split("X:")[1].split(",")[0]
-                    y_str = data_part.split("Y:")[1]
-                    
-                    x = int(x_str)
-                    y = int(y_str)
-                    
-            except Exception as e:
-                print(f"Real-time parsing error: {e}")
-                pass  # Ignore parsing errors
-                
+                ser.close()
+            except:
+                pass
+
         except Exception as e:
-            print(f"Serial read error: {e}")
-            break
+            print(f"Error opening {port.device}: {e}")
+            try:
+                if ser:
+                    ser.close()
+            except:
+                pass
+            continue
 
-    # Compute roll and pitch angles
-    roll = ((x - center_x) / (1023 / 2)) * roll_max_deg  # Normalize to -45 to +45 degrees
-    pitch = ((y - center_y) / (1023 / 2)) * pitch_max_deg  # Normalize to -30 to +30 degrees
+    print("\n❌ No joystick found!")
+    sys.exit(1)
 
-    # Draw the scene (simulating 3D view with horizon tilt for roll and shift for pitch)
-    screen.fill((135, 206, 235))  # Sky blue
+class FlightDisplay:
+    def __init__(self):
+        # --- Enhanced scene: sky gradient, sun, runway, hangars and 3D-ish plane ---
+        pygame.init()
+        self.width = 800
+        self.height = 600
+        # main drawing surface
+        self.screen = pygame.display.set_mode((self.width, self.height))
+        pygame.display.set_caption("3D Flight Simulator")
 
-    width = 800
-    height = 600
-    mid_y = height // 2
+        # timing and font
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.Font(None, 28)
+        self.fps_target = 120
+        self.fps_history = []
+        self.update_times = []
 
-    # Pitch offset (moves horizon up/down)
-    pitch_offset = -pitch * (height / (2 * pitch_max_deg))  # Scale to screen height
+        # Initialize flight state
+        self.center_x = 448
+        self.center_y = 461
+        self.current_x = float(self.center_x)
+        self.current_y = float(self.center_y)
+        self.roll_max = 45
+        self.pitch_max = 30
 
-    # Roll in radians for calculations
-    roll_rad = math.radians(roll)
+    def update(self, x, y):
+        # External update from serial parser
+        self.current_x = float(x)
+        self.current_y = float(y)
 
-    # Calculate horizon y positions for left and right (for tilt)
-    horizon_dy = math.sin(roll_rad) * (width / 2)
-    horizon_left_y = mid_y + pitch_offset - horizon_dy
-    horizon_right_y = mid_y + pitch_offset + horizon_dy
+    def render(self):
+        start_time = time.time()
 
-    # Clamp to screen bounds if needed
-    horizon_left_y = max(0, min(height, horizon_left_y))
-    horizon_right_y = max(0, min(height, horizon_right_y))
+        # Compute angles from current readings
+        roll = ((self.current_x - self.center_x) * self.roll_max) / 511.5
+        pitch = ((self.current_y - self.center_y) * self.pitch_max) / 511.5
 
-    # Draw ground polygon (green)
-    ground_points = [
-        (0, height),
-        (width, height),
-        (width, horizon_right_y),
-        (0, horizon_left_y)
-    ]
-    pygame.draw.polygon(screen, (34, 139, 34), ground_points)
+        width = self.width
+        height = self.height
 
-    # Draw horizon line
-    pygame.draw.line(screen, (0, 0, 0), (0, horizon_left_y), (width, horizon_right_y), 2)
+        # Sky gradient (top -> bottom)
+        top = (250, 200, 120)
+        mid = (135, 206, 235)
+        bottom = (100, 150, 200)
+        for i in range(height):
+            t = i / height
+            if t < 0.5:
+                mix = t * 2
+                color = (
+                    int(top[0] * (1 - mix) + mid[0] * mix),
+                    int(top[1] * (1 - mix) + mid[1] * mix),
+                    int(top[2] * (1 - mix) + mid[2] * mix)
+                )
+            else:
+                mix = (t - 0.5) * 2
+                color = (
+                    int(mid[0] * (1 - mix) + bottom[0] * mix),
+                    int(mid[1] * (1 - mix) + bottom[1] * mix),
+                    int(mid[2] * (1 - mix) + bottom[2] * mix)
+                )
+            pygame.draw.line(self.screen, color, (0, i), (width, i))
 
-    # Draw fixed airplane indicator (crosshair in center, like a heads-up display)
-    pygame.draw.line(screen, (255, 0, 0), (400 - 20, 300), (400 + 20, 300), 3)  # Horizontal
-    pygame.draw.line(screen, (255, 0, 0), (400, 300 - 20), (400, 300 + 20), 3)  # Vertical
+        # Sun
+        sun_x = width * 0.85
+        sun_y = height * 0.15 + pitch * 0.5
+        pygame.draw.circle(self.screen, (255, 230, 100), (int(sun_x), int(sun_y)), 36)
+        for r in (50, 70):
+            s = pygame.Surface((r*2, r*2), pygame.SRCALPHA)
+            pygame.draw.circle(s, (255, 230, 100, 12), (r, r), r)
+            self.screen.blit(s, (sun_x - r, sun_y - r))
+
+        # Hangars/dishes
+        base_y = height * 0.45 - pitch * 0.3
+        roll_shift = math.tan(math.radians(roll)) * 80
+        for i in range(3):
+            x = 120 - i*60 - roll_shift
+            y = base_y + i*18
+            pygame.draw.rect(self.screen, (110,110,110), (x, y, 80, 40))
+            pygame.draw.polygon(self.screen, (90,90,90), [(x, y), (x+40, y-20), (x+80, y)])
+        for i in range(3):
+            x = width - 200 + i*60 - roll_shift
+            y = base_y + i*22
+            pygame.draw.polygon(self.screen, (140,140,140), [(x,y),(x+20,y-20),(x+40,y)])
+            pygame.draw.circle(self.screen, (60,60,60), (int(x+20), int(y-8)), 8)
+
+        # Runway
+        mid_x = width // 2
+        horizon_y = height * 0.45 - pitch * (height / (2 * self.pitch_max))
+        roll_rad = math.radians(roll)
+        vanishing_offset = math.tan(roll_rad) * width * 0.6
+        left_vanish_x = mid_x - vanishing_offset
+        right_vanish_x = mid_x + vanishing_offset
+        near_width = width * 0.6
+        far_width = width * 0.06
+        near_y = height * 0.85
+        far_y = max(40, horizon_y)
+        left_near = (mid_x - near_width/2, near_y)
+        right_near = (mid_x + near_width/2, near_y)
+        left_far = (left_vanish_x - far_width/2, far_y)
+        right_far = (right_vanish_x + far_width/2, far_y)
+        pygame.draw.polygon(self.screen, (55,55,60), [left_near, right_near, right_far, left_far])
+        num_dashes = 12
+        for i in range(num_dashes):
+            t1 = i / num_dashes
+            t2 = (i + 0.6) / num_dashes
+            x1 = left_near[0] + (left_far[0] - left_near[0]) * t1
+            x2 = left_near[0] + (left_far[0] - left_near[0]) * t2
+            y1 = near_y + (far_y - near_y) * t1
+            y2 = near_y + (far_y - near_y) * t2
+            cx1 = (x1 + (right_near[0] + (right_far[0] - right_near[0]) * t1)) / 2
+            cx2 = (x2 + (right_near[0] + (right_far[0] - right_near[0]) * t2)) / 2
+            pygame.draw.line(self.screen, (240,240,240), (cx1, y1), (cx2, y2), 4)
+        pygame.draw.line(self.screen, (200,200,200), left_near, left_far, 2)
+        pygame.draw.line(self.screen, (200,200,200), right_near, right_far, 2)
+
+        # Plane (simple shapes)
+        cx = width//2
+        cy = int(height*0.62)
+        body_length = 140
+        body_w = 18
+        wing_span = 200
+        fusage_rect = pygame.Rect(0,0, body_w, body_length)
+        fusage_rect.center = (cx, cy)
+        pygame.draw.ellipse(self.screen, (80,80,80), fusage_rect)
+        wing_color = (120,120,120)
+        left_wing = [(cx - 10, cy), (cx - wing_span//2, cy + 10), (cx - wing_span//2 + 20, cy + 24), (cx - 6, cy + 6)]
+        right_wing = [(cx + 10, cy), (cx + wing_span//2, cy + 10), (cx + wing_span//2 - 20, cy + 24), (cx + 6, cy + 6)]
+        def tilt_point(p):
+            dx = p[0] - cx
+            dy = p[1] - cy
+            angle = math.radians(roll * 0.6)
+            rx = dx * math.cos(angle) - dy * math.sin(angle)
+            ry = dx * math.sin(angle) + dy * math.cos(angle)
+            return (cx + rx, cy + ry)
+        left_wing = [tilt_point(p) for p in left_wing]
+        right_wing = [tilt_point(p) for p in right_wing]
+        pygame.draw.polygon(self.screen, wing_color, left_wing)
+        pygame.draw.polygon(self.screen, wing_color, right_wing)
+        tail = [(cx-6, cy+body_length//4), (cx+6, cy+body_length//4), (cx, cy+body_length//4 - 30)]
+        pygame.draw.polygon(self.screen, (100,100,100), tail)
+        pygame.draw.ellipse(self.screen, (20,60,120), (cx-14, cy-40, 28, 22))
+        flame_color = (255,140,0) if pitch < 0 else (200,80,0)
+        flame_rect = pygame.Rect(cx-10, cy+body_length//2, 20, 26)
+        pygame.draw.ellipse(self.screen, flame_color, flame_rect)
+        shadow = pygame.Surface((220,70), pygame.SRCALPHA)
+        pygame.draw.ellipse(shadow, (0,0,0,90), shadow.get_rect())
+        self.screen.blit(shadow, (cx-110, cy+30))
+
+        # HUD
+        pygame.draw.line(self.screen, (255, 0, 0), (400 - 20, 300), (400 + 20, 300), 3)
+        pygame.draw.line(self.screen, (255, 0, 0), (400, 300 - 20), (400, 300 + 20), 3)
+
+        # Show debug
+        self.show_debug_info(roll, pitch)
+
+        # Flip and timing
+        pygame.display.flip()
+        self.clock.tick(self.fps_target)
+
+        # Track frame time
+        self.update_times.append(time.time() - start_time)
+        if len(self.update_times) > 60:
+            self.update_times.pop(0)
+            
+    def show_debug_info(self, roll, pitch):
+        # Show position and angles
+        text = self.font.render(
+            f"X: {self.current_x}  Y: {self.current_y}", True, (0, 0, 0))
+        self.screen.blit(text, (10, 10))
+        
+        text = self.font.render(
+            f"Roll: {roll:.1f}°  Pitch: {pitch:.1f}°", True, (0, 0, 0))
+        self.screen.blit(text, (10, 50))
+        
+        # Show FPS and timing
+        fps = self.clock.get_fps()
+        self.fps_history.append(fps)
+        if len(self.fps_history) > 60:
+            self.fps_history.pop(0)
+        
+        avg_fps = sum(self.fps_history) / len(self.fps_history) if self.fps_history else 0
+        avg_update = sum(self.update_times) / len(self.update_times) * 1000 if self.update_times else 0
+        
+        text = self.font.render(
+            f"FPS: {int(avg_fps)} Frame Time: {avg_update:.1f}ms", True, (0, 0, 0))
+        self.screen.blit(text, (10, 90))
+
+def main():
+    # Initialize hardware
+    print("🔍 Searching for joystick...")
+    ser = find_bluetooth_port()
+    ser.reset_input_buffer()  # Start fresh
     
-    # Display current values
-    font = pygame.font.Font(None, 36)
-    text = font.render(f"X: {x}, Y: {y}, Roll: {roll:.1f}°, Pitch: {pitch:.1f}°", True, (0, 0, 0))
-    screen.blit(text, (10, 10))
+    # Initialize display
+    display = FlightDisplay()
+    
+    running = True
+    last_data = 0
+    frame_count = 0
+    
+    while running:
+        # Event handling
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+        
+        # Read all available serial data with non-blocking approach
+        if ser.in_waiting:
+            try:
+                # Read all available data at once
+                data = ser.read(ser.in_waiting).decode(errors='ignore')
+                lines = data.splitlines()
+                
+                # Process only the most recent complete line
+                for line in reversed(lines):
+                    if "X:" in line and "Y:" in line:
+                        try:
+                            x_part, y_part = line.split(",")
+                            x = int(''.join(c for c in x_part if c.isdigit()))
+                            y = int(''.join(c for c in y_part if c.isdigit()))
+                            
+                            if 0 <= x <= 1023 and 0 <= y <= 1023:
+                                display.update(x, y)
+                                last_data = time.time()
+                                break
+                        except ValueError:
+                            continue
+                            
+            except Exception as e:
+                print(f"Read error: {e}")
+        
+        # Render frame
+        display.render()
+        
+        # Maintain high frame rate
+        display.clock.tick(165)  # Target 165 FPS for smooth motion
+        
+        frame_count += 1
+        if frame_count % 60 == 0:  # Log every 60 frames
+            data_age = time.time() - last_data
+            if data_age > 0.1:  # More than 100ms old
+                print(f"⚠️ Data age: {data_age*1000:.0f}ms")
+    
+    # Cleanup
+    ser.close()
+    pygame.quit()
 
-    pygame.display.flip()
-    clock.tick(60)
-
-# Cleanup
-ser.close()
-pygame.quit()
+if __name__ == "__main__":
+    main()
