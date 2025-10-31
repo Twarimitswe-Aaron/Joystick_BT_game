@@ -12,43 +12,110 @@ from OpenGL.GLU import *
 BAUD = 38400
 
 def find_working_port():
-    """Scan for active COM port with expected data format"""
-    ports = [p.device for p in serial.tools.list_ports.comports()]
-    print("Available ports:", ports)
+    """Scan for active COM port with expected data format in descending order"""
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("❌ No COM ports found!")
+        return None, None
 
-    for port in ports:
+    # Sort ports by COM number (highest first)
+    def get_com_num(port):
         try:
-            ser = serial.Serial(port, BAUD, timeout=1)
-            print(f"Listening on {port}...")
-            time.sleep(2)
+            return int(''.join(filter(str.isdigit, port.device)))
+        except:
+            return 0
+    ports.sort(key=get_com_num, reverse=True)
 
-            for _ in range(10):
-                data = ser.readline().decode(errors='ignore').strip()
-                if data and ("X:" in data and "Y:" in data):
-                    print(f"\nData found on {port}: {data}")
-                    return ser, port
+    # Print available ports in descending order
+    print("\n🔍 Available COM ports (highest to lowest):")
+    for port in ports:
+        print(f"  • {port.device}: {port.description}")
+
+    # Try preferred ports first (Bluetooth / HC-05 / Arduino)
+    preferred_keywords = ("HC-05", "Bluetooth", "Arduino", "Serial")
+    def port_priority(p):
+        desc = (p.description or "").lower()
+        for kw in preferred_keywords:
+            if kw.lower() in desc:
+                return 0
+        return 1
+    ports.sort(key=port_priority)  # Prioritize but keep descending order within priority
+
+    # Detection strategy: try each port, require multiple valid readings
+    for port in ports:
+        print(f"\n📡 Testing {port.device} ({port.description})...")
+        ser = None
+        try:
+            ser = serial.Serial(port.device, BAUD, timeout=0.1)
+            time.sleep(0.1)  # Brief pause for device
+            ser.reset_input_buffer()
+
+            valid_count = 0
+            attempts = 0
+            start = time.time()
             
-            ser.close()
+            # Try for up to 2 seconds
+            while time.time() - start < 2.0 and attempts < 60:
+                attempts += 1
+                try:
+                    raw = ser.readline()
+                    if not raw:
+                        time.sleep(0.02)
+                        continue
+                    
+                    data = raw.decode(errors='ignore')
+                    print(f"  raw[{port.device}]: {repr(data)}")
+                    s = data.strip()
+                    
+                    if s and "X:" in s and "Y:" in s:
+                        print(f"    attempting parse: {s}")
+                        x_norm, y_norm = parse_sensor_data(s)
+                        if x_norm is not None:  # Successfully parsed
+                            valid_count += 1
+                            if valid_count >= 2:  # Require 2 valid readings
+                                print(f"✅ Found joystick on {port.device}")
+                                print(f"   Last reading: x_norm={x_norm:.3f}, y_norm={y_norm:.3f}")
+                                return ser, port.device
+                
+                except Exception as e:
+                    print(f"    parse error: {e}")
+                    time.sleep(0.02)
+                    continue
+
+            if ser:
+                ser.close()
+
         except Exception as e:
-            print(f"Error on port {port}: {e}")
+            print(f"Error on {port.device}: {e}")
+            if ser:
+                try:
+                    ser.close()
+                except:
+                    pass
             continue
 
-    print("\nNo active COM port produced expected data format.")
+    print("\n❌ No joystick found!")
     return None, None
 
 def parse_sensor_data(line):
-    """Parse data in format: 08:59:30.001 -> X: 448 | Y: 461"""
+    """Parse data in format: X:448,Y:461"""
     try:
-        match = re.search(r'X:\s*(\d+)\s*\|\s*Y:\s*(\d+)', line)
-        if match:
-            x = int(match.group(1))
-            y = int(match.group(2))
+        # Split by comma and extract numbers
+        parts = line.split(',')
+        if len(parts) >= 2:
+            x_str = parts[0]
+            y_str = parts[1]
             
+            # Extract numbers only
+            x = int(''.join(c for c in x_str if c.isdigit()))
+            y = int(''.join(c for c in y_str if c.isdigit()))
+            
+            # Normalize to -1..1 range
             x_norm = (x - 512) / 512.0
             y_norm = (y - 512) / 512.0
             
             return x_norm, y_norm
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, IndexError) as e:
         pass
     return None, None
 
